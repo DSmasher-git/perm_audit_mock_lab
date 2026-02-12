@@ -12,6 +12,7 @@ from src.perm_audit import (
 )
 
 
+
 def test_world_writable_true():
     assert is_world_writable(0o666) is True
 
@@ -20,13 +21,15 @@ def test_world_writable_false():
     assert is_world_writable(0o644) is False
 
 
-def test_suid_bit():
+def test_suid_sgid_sticky_bits():
     assert has_suid(0o4755) is True
-
-
-def test_sticky_bit():
-    # Должно быть True для 0o1777 (как /tmp)
+    assert has_sgid(0o2755) is True
     assert has_sticky(0o1777) is True
+
+
+def test_severity_critical_when_suid_and_world_writable():
+    assert severity_for(0o4777, is_dir=False) == "critical"
+
 
 
 def test_scan_tree_with_monkeypatch(monkeypatch):
@@ -38,10 +41,8 @@ def test_scan_tree_with_monkeypatch(monkeypatch):
         Path("/FAKE_ROOT/tmpdir"),
     ]
 
-    # 1) подменяем rglob: возвращаем заранее заданные пути
     monkeypatch.setattr(Path, "rglob", lambda self, pattern: fake_paths)
 
-    # 2) подменяем is_file/is_dir
     def fake_is_file(self):
         return self.name in {"world.txt", "suidbin"}
 
@@ -51,29 +52,29 @@ def test_scan_tree_with_monkeypatch(monkeypatch):
     monkeypatch.setattr(Path, "is_file", fake_is_file)
     monkeypatch.setattr(Path, "is_dir", fake_is_dir)
 
-    # 3) подменяем stat(): отдаём режимы для каждого пути
     modes = {
-        "/FAKE_ROOT/world.txt": statmod.S_IFREG | 0o666,   # world-writable file
-        "/FAKE_ROOT/suidbin":   statmod.S_IFREG | 0o4755,  # SUID file
-        "/FAKE_ROOT/tmpdir":    statmod.S_IFDIR | 0o1777,  # sticky dir
+        "/FAKE_ROOT/world.txt": statmod.S_IFREG | 0o666,
+        "/FAKE_ROOT/suidbin":   statmod.S_IFREG | 0o4755,
+        "/FAKE_ROOT/tmpdir":    statmod.S_IFDIR | 0o1777,
     }
 
-    def fake_stat(self):
-        m = modes[str(self)]
-        return os.stat_result((m, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    original_stat = Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        key = str(self).replace("\\", "/")
+
+        if key in modes:
+            m = modes[key]
+            return os.stat_result((m, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+        return original_stat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", fake_stat)
 
     findings = scan_tree(root)
 
-    kinds = {(f.path, f.kind) for f in findings}
+    kinds = {(f.path.replace("\\", "/"), f.kind) for f in findings}
+
     assert ("/FAKE_ROOT/world.txt", "world_writable") in kinds
     assert ("/FAKE_ROOT/suidbin", "suid") in kinds
-
-    # ВАЖНО: sticky_dir должен появиться после того, как студент исправит код
     assert ("/FAKE_ROOT/tmpdir", "sticky_dir") in kinds
-
-
-# TODO (дописать студенту):
-# 1) test_sgid_bit() -> проверить, что has_sgid(0o2755) == True
-# 2) test_severity_critical() -> severity_for(0o4777, is_dir=False) == "critical"
